@@ -1,0 +1,26 @@
+# 敏感信息
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# RAG 索引
+.memory/
+.faiss_index
+.faiss_ids.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# 数据文件（可选，如果你想保留对话历史就注释掉）
+sessions/
+agent_memory.json
+agent_memory.md
+chat_history.json
+embedding_cache.npz
