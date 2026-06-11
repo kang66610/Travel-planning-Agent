@@ -28,7 +28,6 @@ def init_rag():
     if RAG_READY:
         return True
     try:
-        import os
         os.environ["HF_ENDPOINT"] = HF_MIRROR  # 设置 HuggingFace 镜像
 
         from sentence_transformers import SentenceTransformer
@@ -98,10 +97,12 @@ def add_to_index(fact: dict):
 
 
 def remove_from_index(fact_id: int):
-    """从索引中移除一条 fact（FAISS 不支持删除，需要重建）"""
+    """从索引中移除一条 fact（需要重建索引）"""
     global _index, _fact_ids
     if fact_id in _fact_ids:
         _fact_ids.remove(fact_id)
+        # FAISS IndexFlatIP 不支持删除，需要从 facts 列表重建
+        # 调用方负责传入正确的 facts 列表调用 rebuild_index
 
 
 def rebuild_index(facts: list):

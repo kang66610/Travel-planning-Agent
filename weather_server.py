@@ -16,16 +16,15 @@ import memory_rag
 app = Flask(__name__)
 
 # ================= 配置区域 =================
-# 从 .env 文件或环境变量读取
-import os as _os
 from dotenv import load_dotenv
 load_dotenv()
 
-DEEPSEEK_API_KEY = _os.environ.get("DEEPSEEK_API_KEY", "")
-QWEATHER_API_KEY = _os.environ.get("QWEATHER_API_KEY", "")
-QWEATHER_HOST = _os.environ.get("QWEATHER_HOST", "n63tehkbee.re.qweatherapi.com")
-AQICN_TOKEN = _os.environ.get("AQICN_TOKEN", "")
-GAODE_API_KEY = _os.environ.get("GAODE_API_KEY", "")
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
+QWEATHER_API_KEY = os.environ.get("QWEATHER_API_KEY", "")
+QWEATHER_HOST = os.environ.get("QWEATHER_HOST", "n63tehkbee.re.qweatherapi.com")
+AQICN_TOKEN = os.environ.get("AQICN_TOKEN", "")
+GAODE_API_KEY = os.environ.get("GAODE_API_KEY", "")
+MODEL_NAME = "deepseek-v4-flash"
 MEMORY_DIR = os.path.dirname(os.path.abspath(__file__))
 MEMORY_JSON = os.path.join(MEMORY_DIR, "agent_memory.json")
 MEMORY_MD = os.path.join(MEMORY_DIR, "agent_memory.md")
@@ -78,17 +77,16 @@ def _migrate_old_memory(old: dict) -> dict:
     new["user_profile"]["favorite_cities"] = old.get("favorite_cities", [])
     new["user_profile"]["clothing_preference"] = old.get("clothing_preference", "normal")
     new["query_history"] = old.get("query_history", [])[-50:]
-    save_memory(new)
+    save_memory(new, rebuild_index=True)
     return new
 
-def save_memory(memory: dict):
+def save_memory(memory: dict, rebuild_index: bool = False):
     memory["version"] = 2
     with open(MEMORY_JSON, "w", encoding="utf-8") as f:
         json.dump(memory, f, ensure_ascii=False, indent=2)
-    # 同步导出 Markdown
     _export_memory_md(memory)
-    # 同步更新向量索引
-    if memory_rag.RAG_READY:
+    # 仅在明确需要时重建索引（add_fact 已增量更新）
+    if rebuild_index and memory_rag.RAG_READY:
         memory_rag.rebuild_index(memory.get("facts", []))
 
 def _next_fact_id(memory: dict) -> int:
@@ -185,8 +183,11 @@ def get_relevant_memories(memory: dict, user_query: str) -> str:
     if profile_items:
         parts.append("## 用户画像\n" + "\n".join(f"- {item}" for item in profile_items))
 
-    # 搜索相关事实
-    relevant = search_memory(memory, user_query)
+    # 搜索相关事实（跳过空查询）
+    if user_query == "__profile_only__":
+        relevant = []
+    else:
+        relevant = search_memory(memory, user_query)
     if relevant:
         fact_lines = []
         for f in relevant[:8]:
@@ -226,7 +227,7 @@ def auto_extract_facts(memory: dict, user_query: str, assistant_reply: str):
 最多提取 5 条。"""
 
         response = client.chat.completions.create(
-            model="deepseek-v4-flash",
+            model=MODEL_NAME,
             messages=[{"role": "user", "content": extract_prompt}],
             max_tokens=300,
             temperature=0.1
@@ -283,7 +284,9 @@ def _update_profile(memory: dict, user_query: str, assistant_reply: str):
             skip_words = {"今天", "明天", "昨天", "天气", "怎么样", "如何", "查询", "穿衣",
                           "建议", "预报", "空气", "质量", "指数", "日出", "日落", "预警"}
             if city not in skip_words:
-                profile.setdefault("favorite_cities", []).append(city)
+                favs = profile.setdefault("favorite_cities", [])
+                if city not in favs and len(favs) < 20:
+                    favs.append(city)
 
     # 提取不喜欢的天气
     if "不喜欢" in user_query or "讨厌" in user_query:
@@ -391,7 +394,7 @@ def record_conversation(memory: dict, user_query: str, assistant_reply: str, too
 
 输出格式: 直接输出摘要句子，不要前缀。"""
         response = client.chat.completions.create(
-            model="deepseek-v4-flash",
+            model=MODEL_NAME,
             messages=[{"role": "user", "content": summary_prompt}],
             max_tokens=60,
             temperature=0.1
@@ -439,6 +442,9 @@ def _cache_key(func_name: str, *args) -> str:
 
 # ================= 工具层 =================
 def _get_location_id(city: str) -> dict:
+    cached = _cache_get(f"geo:{city}")
+    if cached:
+        return cached
     host = QWEATHER_HOST.replace("https://", "").replace("http://", "").strip(" /[]")
     geo_url = f"https://{host}/geo/v2/city/lookup?location={city}&key={QWEATHER_API_KEY}"
     geo_res = requests.get(geo_url, timeout=10).json()
@@ -448,7 +454,9 @@ def _get_location_id(city: str) -> dict:
     if not locations:
         return None
     loc = locations[0]
-    return {"id": loc["id"], "name": loc["name"], "country": loc["country"]}
+    result = {"id": loc["id"], "name": loc["name"], "country": loc["country"]}
+    _cache_set(f"geo:{city}", result)
+    return result
 
 def get_weather(city: str) -> str:
     try:
@@ -842,9 +850,7 @@ def delete_memory_fact(fact_id: int) -> str:
     """删除一条记忆事实"""
     global session_memory
     session_memory["facts"] = [f for f in session_memory["facts"] if f["id"] != fact_id]
-    if memory_rag.RAG_READY:
-        memory_rag.rebuild_index(session_memory.get("facts", []))
-    save_memory(session_memory)
+    save_memory(session_memory, rebuild_index=True)
     return json.dumps({"status": "deleted", "fact_id": fact_id}, ensure_ascii=False)
 
 # ================= 新增工具 =================
@@ -957,7 +963,10 @@ TOOLS = [
         "origin_city": {"type": "string", "description": "出发城市"},
         "dest_city": {"type": "string", "description": "目的地城市"},
         "mode": {"type": "string", "enum": ["drive", "transit", "walk", "bike"], "description": "出行方式", "default": "drive"}
-    }, "required": ["origin_city", "dest_city"]}}}
+    }, "required": ["origin_city", "dest_city"]}}},
+    {"type": "function", "function": {"name": "get_geocode", "description": "地理编码：将地址/地名转换为经纬度坐标", "parameters": {"type": "object", "properties": {
+        "address": {"type": "string", "description": "地址或地名，如：北京市天安门"}
+    }, "required": ["address"]}}}
 ]
 
 TOOL_MAP = {
@@ -983,35 +992,6 @@ TOOL_EMOJIS = {
     "search_pois": "📍", "search_scenic": "🏔️", "search_food": "🍜",
     "get_travel_route": "🚗", "get_geocode": "📌"
 }
-
-# ================= 对话历史持久化 =================
-def load_chat_history() -> list:
-    """加载对话历史"""
-    if os.path.exists(CHAT_HISTORY_FILE):
-        try:
-            with open(CHAT_HISTORY_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except (json.JSONDecodeError, IOError):
-            pass
-    return []
-
-def save_chat_history(history: list):
-    """保存对话历史（保留最近 200 条）"""
-    history = history[-200:]
-    with open(CHAT_HISTORY_FILE, "w", encoding="utf-8") as f:
-        json.dump(history, f, ensure_ascii=False, indent=2)
-
-def add_chat_record(history: list, role: str, content: str, tool_calls: list = None):
-    """添加一条对话记录"""
-    record = {
-        "time": datetime.now().isoformat(),
-        "role": role,
-        "content": content
-    }
-    if tool_calls:
-        record["tool_calls"] = tool_calls
-    history.append(record)
-    save_chat_history(history)
 
 # ================= 会话管理系统 =================
 def _gen_session_id() -> str:
@@ -1050,7 +1030,7 @@ def save_session(session: dict):
         json.dump(session, f, ensure_ascii=False, indent=2)
 
 def list_sessions() -> list:
-    """列出所有会话（按更新时间倒序）"""
+    """列出所有会话（按更新时间倒序），清理空会话"""
     sessions = []
     for fname in os.listdir(SESSIONS_DIR):
         if not fname.endswith(".json"):
@@ -1059,12 +1039,16 @@ def list_sessions() -> list:
             path = os.path.join(SESSIONS_DIR, fname)
             with open(path, "r", encoding="utf-8") as f:
                 s = json.load(f)
+            msg_count = len(s.get("messages", []))
+            if msg_count == 0:
+                os.remove(path)
+                continue
             sessions.append({
                 "id": s["id"],
                 "title": s.get("title", "新对话"),
                 "created": s.get("created", ""),
                 "updated": s.get("updated", ""),
-                "msg_count": len(s.get("messages", []))
+                "msg_count": msg_count
             })
         except Exception:
             continue
@@ -1092,7 +1076,7 @@ def auto_title_session(session: dict, first_query: str):
     """用 LLM 自动生成会话标题，直接修改 session 对象"""
     try:
         response = client.chat.completions.create(
-            model="deepseek-v4-flash",
+            model=MODEL_NAME,
             messages=[{"role": "user", "content": f"用8个字以内概括这次对话主题，只输出标题，不要前缀和标点：\n用户说：{first_query[:100]}"}],
             max_tokens=30,
             temperature=0.1
@@ -1189,7 +1173,8 @@ SYSTEM_PROMPT = """你是一个专业的**个人出行规划助手**，具备实
 
 def build_system_prompt(memory: dict) -> str:
     parts = [SYSTEM_PROMPT]
-    memory_context = get_relevant_memories(memory, "")
+    # 只加载用户画像和最近对话摘要，不搜索（空查询无意义）
+    memory_context = get_relevant_memories(memory, "__profile_only__")
     if memory_context and memory_context != "暂无相关记忆":
         parts.append(f"\n{memory_context}")
     return "\n".join(parts)
@@ -1276,7 +1261,7 @@ def chat():
         try:
             for iteration in range(MAX_ITERATIONS):
                 response = client.chat.completions.create(
-                    model="deepseek-v4-flash",
+                    model=MODEL_NAME,
                     messages=session_messages,
                     tools=TOOLS
                 )
@@ -1338,7 +1323,7 @@ def chat():
 
             # 超过最大迭代
             final_response = client.chat.completions.create(
-                model="deepseek-v4-flash",
+                model=MODEL_NAME,
                 messages=session_messages + [{"role": "user", "content": "请根据已有信息给出最终回答。"}]
             )
             final_content = final_response.choices[0].message.content
